@@ -97,6 +97,7 @@ class Runner:
         self.base, self.model, self.gen, self.timeout = base.rstrip("/"), model, gen, timeout
         self.lock = threading.Lock()
         self.done = 0
+        self.correct = 0
 
     def ask(self, question: str) -> tuple[str, str, str]:
         """Return (content, reasoning, finish_reason)."""
@@ -131,8 +132,12 @@ class Runner:
             rec["error"] = f"{type(exc).__name__}: {exc}"
         with self.lock:
             self.done += 1
-            if self.done % 25 == 0 or self.done == total:
-                print(f"   {self.done}/{total}", flush=True)
+            self.correct += bool(rec["ok"])
+            step = 5 if self.done <= 20 else 25
+            if self.done % step == 0 or self.done == total:
+                pct = 100.0 * self.done / total
+                print(f"   {self.done}/{total} ({pct:.0f}%)  correct so far: {self.correct}",
+                      flush=True)
         return rec
 
 
@@ -161,8 +166,9 @@ def main() -> None:
         "max_tokens": args.max_tokens,
         "seed": args.seed,
     }
-    print(f">> GSM8K: {len(data)} examples, {args.threads} threads, {json.dumps(gen)}")
-    print(f">> endpoint {args.base} model {args.model!r}")
+    print(f">> GSM8K: {len(data)} examples, {args.threads} threads, {json.dumps(gen)}", flush=True)
+    print(f">> endpoint {args.base} model {args.model!r}", flush=True)
+    print(">> reference: RadixArk published 97.27% (1283/1319) on this protocol", flush=True)
 
     runner = Runner(args.base, args.model, gen, args.timeout)
     t0 = time.time()
