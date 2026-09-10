@@ -193,6 +193,23 @@ If your priority is raw throughput rather than the agent's reliability, the fast
 - The base image is multi-arch, so `docker build` also works on x86 Blackwell
   (sm_120, e.g. RTX PRO 6000) for testing, though this is tuned for the Spark.
 
+**Download speed.** `scripts/download-weights.sh` disables the Xet backend, because it
+stalled on some Spark setups. That is a stability choice, not a speed one, and on a fast
+link it costs a lot: `--max-workers` parallelises across *files*, so a checkpoint that is
+a dozen large shards leaves most of a gigabit idle. Measured on a DGX Spark on gigabit
+fibre, pulling 81 GB:
+
+| | rate | 81 GB takes |
+|---|---|---|
+| plain HTTPS, 8 workers (default) | 14.7 MB/s (117 Mbit/s) | ~92 min |
+| `XET=1` | **101 MB/s (809 Mbit/s)** | **13.4 min** |
+
+`XET=1` opts back in, and Xet-backed repos are the ones whose API tree entries carry an
+`xetHash`. It stays off by default because that run still ended in an `httpx.ReadTimeout`
+*after* the last file completed — every blob was intact, but the exit code was non-zero,
+so anything that trusts it will think the download failed. Re-run to confirm; it is
+resumable, and a finished download re-checks in seconds.
+
 ## Quickstart
 
 The commands are in the [TL;DR](#tldr--run-it-on-a-dgx-spark) at the top. Once the log says
@@ -301,6 +318,95 @@ different donor revision needs re-gating.
 scripts/prepare-mtp-graft.sh              # one-time, after prepare-hybrid.sh
 MODE=hybrid-mtp scripts/serve.sh
 ```
+
+### Compressed-tensors checkpoints (`MODE=ct`)
+
+Not every Flash-Next checkpoint on the Hub is ModelOpt-NVFP4. A second family comes out
+of **llm-compressor / compressed-tensors** — for example
+[orcarouter/Qwen3.8-Flash-Next-Uncensored-NVFP4](https://huggingface.co/orcarouter/Qwen3.8-Flash-Next-Uncensored-NVFP4)
+— and it makes the opposite choices about what to quantize:
+
+| | RadixArk (ModelOpt) | compressed-tensors family |
+|---|---|---|
+| Routed experts | NVFP4 `weight`/`weight_scale`/`weight_scale_2`/**`input_scale`** | NVFP4 `weight_packed`/`weight_scale`/`weight_global_scale`, **no activation scales** |
+| GDN in/out, QSA q/k/v/o, shared experts | bf16 (`prepare-hybrid.sh` converts them) | **already fp8-e4m3**, per-channel — nothing to convert |
+| PLE n-gram table | **fp8 + one global scale, 47.7 GiB** | **bf16, 95.4 GiB** |
+| MTP draft head | bf16 fused | bf16 fused (same) |
+| `layer_types` | `full_attention` | `qwen_sparse_attention` (transformers ≥ 5.16 rename) |
+
+`scripts/prepare-ct.sh` builds a `<snapshot>-ctprep/` sibling that fixes the two things
+that actually block this recipe. Nothing is copied — like the other prep scripts it is
+relative symlinks plus a rewritten `config.json` and index.
+
+**1. `layer_types`.** transformers 5.16 renamed the sparse-attention layer type. The vLLM
+in this image knows only `full_attention`: `Qwen3_8FlashNextDecoderLayer` raises
+`Invalid layer_type qwen_sparse_attention`, and — more quietly — `_qsa_layer_ids` comes
+out **empty**, which would break the QSA cache-scale remapping even if the first error
+did not fire. `full_attention` + `indexer_n_heads` is exactly how the old naming spelled
+"QSA layer", so renaming the 12 entries back is a rename, not a behaviour change.
+
+**2. The PLE table.** A bf16 table works — `src/vllm_ple_mmap.py` has supported 16-bit
+tables since @Saren-Arterius's AutoRound work — but it costs 5,120 bytes of NVMe per
+token instead of 2,560, and at `GPU_MEM=0.80` the page cache holds roughly half as much
+of it. The table is a pure lookup that abliterations and fine-tunes do not touch, so the
+fp8 table from a donor checkpoint of the same base model can be substituted wholesale:
+same tensor names, same 128 × (2,500,012 × 160) geometry, same row ordering.
+
+Do not take that on faith — `tools/verify_ple_donor.py` samples rows from the target's
+own table and compares them against the dequantized donor, and it does it over **HTTP
+range requests**, so the 102 GB shard never has to be downloaded. Against orcarouter it
+reports p50 relative error 0.022, p99 0.054 and correlation 0.99964 across every sampled
+block — which is precisely fp8-e4m3 rounding noise (e4m3's mantissa step is 6.25%), i.e.
+the same table. Confirming that also means you can **skip the 102 GB shard entirely** and
+download 81 GB instead of 183 GB.
+
+```bash
+MODEL=orcarouter/Qwen3.8-Flash-Next-Uncensored-NVFP4
+# the PLE shard is redundant once the donor is verified
+docker run --rm -e HF_HOME=/hf -e HF_TOKEN -v "$HOME/.cache/huggingface:/hf" \
+  --entrypoint bash qwen38-flash-dgx -c \
+  "hf download '$MODEL' --max-workers 8 --exclude 'model-00002-of-00017.safetensors'"
+MODEL=$MODEL scripts/prepare-ct.sh        # builds <snapshot>-ctprep/
+MODEL=$MODEL MODE=ct scripts/serve.sh
+```
+
+`PLE=keep` skips the splice and serves the checkpoint's own bf16 table; `PLE_DONOR=`
+picks a different donor (default `RadixArk/Qwen3.8-Flash-Next-NVFP4`, which you already
+have).
+
+**What this costs you, and why.** These checkpoints carry no activation scales, so vLLM
+reads the experts as **weight-only NVFP4** (`use_a16=True`). Both quantization families
+funnel into the same backend oracle (`fused_moe/oracle/nvfp4.py`), but every cutlass path
+there requires `(kNvfp4Static, kNvfp4Dynamic)` — probed on our GB10 (capability 12.1),
+`FLASHINFER_TRTLLM`, `FLASHINFER_CUTEDSL`, `FLASHINFER_CUTLASS` and `VLLM_CUTLASS` all
+reject `(kNvfp4Static, None)` and auto-selection falls through to **`MARLIN`**. The
+side layers land on `CompressedTensorsW8A16Fp8`, which is also Marlin. So:
+
+- **Greedy is not deterministic.** `DET_TOPK=1` still fixes the QSA top-k kernel, but the
+  MoE itself is now the non-deterministic part — the same thing we measured on the Intel
+  AutoRound (Marlin) variant, which stayed non-deterministic even with Marlin atomic adds
+  off. `scripts/smoke-test.sh` will print `NO` for determinism; its hint about
+  `DET_TOPK`/`EXACT_TOPK` is misleading in this mode.
+- **Expect the Marlin speed profile**, not the NVFP4 one: on the int4+fp8 variant that was
+  the *best* raw decode (34.3 tok/s) but the worst prefill and much worse cached TTFT
+  (8.7 s vs 4.1 s on 8 concurrent 20k conversations). We have not yet run the tournament
+  or the speed bench on a compressed-tensors checkpoint — when we do, the numbers go here.
+- Marlin pads the intermediate size to its thread tiles, so resident weights land a little
+  above the ~77 GiB the hybrid uses.
+- `MODE=hybrid` and `scripts/prepare-hybrid.sh` **do not apply** and must not be run: the
+  side layers are already 8-bit, and `tools/fp8_convert.py` would try to re-quantize
+  fp8 tensors as if they were bf16.
+
+Everything else carries over unchanged — PLE mmap, prefix caching, MTP, YaRN 500k, the
+fp8-KV option, and `DRAFT_VOCAB=1` (orcarouter's vocab and merges are identical to
+RadixArk's, so the shipped `src/draft_vocab_65536.npy` ids are still correct; only the
+pre-tokenizer regex differs, and vLLM uses the checkpoint's own tokenizer).
+
+Getting back to `FLASHINFER_CUTLASS` means transcoding the experts into the ModelOpt
+layout — rename `weight_packed` → `weight`, `weight_global_scale` → reciprocal →
+`weight_scale_2` (the two formats store reciprocal global scales), and supply the
+`input_scale` tensors the checkpoint does not have. That is a separate, offline pass; it
+is not in the repo yet.
 
 ## Prefix caching now works (and why it didn't)
 
@@ -418,7 +524,7 @@ full-width logits buffer the patch rebuilds per draft step (about 60k tokens at 
 
 | Var | Default | Notes |
 |---|---|---|
-| `MODE` | `nvfp4` | `hybrid` = fp8 side layers (see above; needs `scripts/prepare-hybrid.sh`). |
+| `MODE` | `nvfp4` | `hybrid` = fp8 side layers (see above; needs `scripts/prepare-hybrid.sh`). `hybrid-mtp` = hybrid + NVFP4 draft experts. `ct` = a compressed-tensors checkpoint (needs `scripts/prepare-ct.sh`; MoE runs on Marlin, greedy is **not** deterministic — see [above](#compressed-tensors-checkpoints-modect)). |
 | `PREFIX_CACHE` | `1` | `--enable-prefix-caching`. Correct with this image (block_size fix). |
 | `DET_TOPK` | `1` | Deterministic QSA top-k **kernel** (vllm#55122): identical outputs at T=0 at full kernel speed. `0` = stock kernel (non-deterministic, may drop attention candidates, issue #3). |
 | `EXACT_TOPK` | `0` | `1` = exact `torch.topk` fallback (deterministic; −8% prefill at 8k, −20–40% at 32k+). Wins over `DET_TOPK` when set. |
@@ -590,11 +696,15 @@ src/patch_qsa_fp8_kv.py           7. fp8_e4m3 KV cache on the QSA path (by @Nane
 src/test_ple_mmap_cpu.py          CPU unit test for the gather (no GPU needed)
 src/test_qsa_exact_topk_cpu.py    CPU unit test for the exact top-k (no GPU needed)
 tools/fp8_convert.py              side-layer bf16 -> blockwise fp8 (by @Saren-Arterius)
-scripts/download-weights.sh
+tools/ct_prepare.py               compressed-tensors checkpoint -> servable snapshot (MODE=ct)
+tools/verify_ple_donor.py         prove a donor FP8 PLE table is the same table, over range requests
+tools/eval_gsm8k.py               GSM8K on the checkpoint author's published protocol
+scripts/download-weights.sh       MODEL, EXCLUDE, MAX_WORKERS, XET
 scripts/prepare-hybrid.sh         one-time: build the -fp8hybrid snapshot
 scripts/prepare-mtp-graft.sh      one-time: graft the NVFP4 MTP draft experts onto it (MODE=hybrid-mtp)
+scripts/prepare-ct.sh             one-time: build the -ctprep snapshot for a compressed-tensors checkpoint
 tools/vllm_watch.py               live per-session view of prompts / reasoning / outputs / stats (needs LOG_REQUESTS=1; @0x3dlux)
-scripts/serve.sh                  MODE=nvfp4|hybrid|hybrid-mtp, PREFIX_CACHE, DET_TOPK, DRAFT_VOCAB, MADVISE, EXACT_TOPK, PAD_M4, KV_DTYPE, YARN, ...
+scripts/serve.sh                  MODE=nvfp4|hybrid|hybrid-mtp|ct, PREFIX_CACHE, DET_TOPK, DRAFT_VOCAB, MADVISE, EXACT_TOPK, PAD_M4, KV_DTYPE, YARN, ...
 scripts/smoke-test.sh             health, coherence, prefix-cache hit, determinism, tok/s
 scripts/greedy-probe.sh           greedy probe set; diff two arms to gate a draft/checkpoint swap
 docs/HOW-IT-WORKS.md
@@ -606,6 +716,26 @@ Run the unit tests (no GPU):
 docker run --rm -v "$PWD/src:/t" -w /t --entrypoint python3 qwen38-flash-dgx test_ple_mmap_cpu.py
 docker run --rm -v "$PWD/src:/t" -w /t --entrypoint python3 qwen38-flash-dgx test_qsa_exact_topk_cpu.py
 ```
+
+### Measuring quality without the tournament
+
+The 17-scenario agentic tournament the defaults are chosen by is not in this repo. For a
+checkpoint swap you still want a quality number, and the RadixArk checkpoint ships one
+with a fully specified protocol (`gsm8k_metrics.json`, `qualification-notes.md`): full
+1319, single-shot, temperature 0.6, top-p 0.95, `max_tokens` 8192, seed 0 -> **97.27%
+(1283/1319)**. `tools/eval_gsm8k.py` reproduces that against a served arm:
+
+```bash
+docker run --rm --network host -v "$PWD/tools:/tools:ro" -v "$HOME/q38-tmp:/q" \
+  --entrypoint python3 qwen38-flash-dgx /tools/eval_gsm8k.py \
+  --cache /q/eval --limit 300 --threads 8 --label hybrid --out /q/eval/gsm8k-hybrid.json
+```
+
+The published number came from SGLang, so treat it as a reference point rather than a
+control: what is meaningful is two arms measured the same way on the same box. This is a
+reasoning model, so with thinking on the full 1319 is 1M+ output tokens and takes hours
+on one Spark -- `--limit 300` resolves to about ±1% at one standard error, enough to
+catch a checkpoint that is actually broken rather than a point worse.
 
 ## Limitations & notes
 
