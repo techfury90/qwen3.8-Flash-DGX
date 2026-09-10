@@ -20,7 +20,7 @@ is actually necessary:
      the old naming spelled "QSA layer", so this is a rename, not a behaviour
      change.
 
-  2. The PLE table (``PLE=donor``, the default). A BF16 table costs 5,120 bytes
+  2. The PLE table (``PLE=donor``, opt-in). A BF16 table costs 5,120 bytes
      of NVMe per token instead of 2,560, and halves how much of it the page cache
      can hold next to the weights. The table is a pure lookup that fine-tunes and
      abliterations do not touch, so an FP8 table from a donor checkpoint of the
@@ -177,7 +177,7 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("target", help="snapshot directory to prepare (modified in place)")
     ap.add_argument("--donor", default="", help="snapshot holding an FP8 PLE table")
-    ap.add_argument("--ple", choices=("donor", "keep"), default="donor")
+    ap.add_argument("--ple", choices=("donor", "keep"), default="keep")
     args = ap.parse_args()
 
     dst = args.target.rstrip("/")

@@ -118,6 +118,14 @@ case "$MODE" in
       exit 1
     fi
     SNAP_NAME="${SNAP_NAME}${SUFFIX}"
+    # These checkpoints carry no activation scales, so every cutlass NvFp4 path
+    # rejects the scheme and auto-selection falls through to Marlin. Say so out
+    # loud: deterministic greedy is a property people rely on this repo for, and
+    # it is not available in this mode.
+    echo "!! MODE=$MODE: this checkpoint has no activation scales, so the MoE runs on"
+    echo "   MARLIN, not FLASHINFER_CUTLASS. GREEDY DECODING IS NOT DETERMINISTIC in"
+    echo "   this mode -- DET_TOPK still fixes the QSA top-k kernel, but the MoE itself"
+    echo "   is now the non-deterministic part. Use MODE=hybrid for deterministic output."
     ;;
   *) echo "!! MODE must be nvfp4, hybrid, hybrid-mtp, ct or ct-mtp"; exit 1 ;;
 esac

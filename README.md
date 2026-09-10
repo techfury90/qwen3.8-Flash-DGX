@@ -345,34 +345,45 @@ out **empty**, which would break the QSA cache-scale remapping even if the first
 did not fire. `full_attention` + `indexer_n_heads` is exactly how the old naming spelled
 "QSA layer", so renaming the 12 entries back is a rename, not a behaviour change.
 
-**2. The PLE table.** A bf16 table works — `src/vllm_ple_mmap.py` has supported 16-bit
-tables since @Saren-Arterius's AutoRound work — but it costs 5,120 bytes of NVMe per
-token instead of 2,560, and at `GPU_MEM=0.80` the page cache holds roughly half as much
-of it. The table is a pure lookup that abliterations and fine-tunes do not touch, so the
-fp8 table from a donor checkpoint of the same base model can be substituted wholesale:
-same tensor names, same 128 × (2,500,012 × 160) geometry, same row ordering.
+**2. The PLE table — served as published by default.** The bf16 table works as-is;
+`src/vllm_ple_mmap.py` has supported 16-bit tables since @Saren-Arterius's AutoRound
+work, so `PLE=keep` (the default) needs nothing beyond the `layer_types` fix.
+
+`PLE=donor` is an **opt-in** optimisation, and it is worth understanding before you
+enable it. A bf16 table costs 5,120 bytes of NVMe per token instead of 2,560, and at
+`GPU_MEM=0.80` the page cache holds roughly half as much of it. Since the table is a pure
+lookup that abliterations and fine-tunes do not touch, the fp8 table from a donor
+checkpoint of the same base model can be substituted wholesale — same tensor names, same
+128 × (2,500,012 × 160) geometry, same row ordering. **The consequence is that the served
+n-gram table then comes from a different repository than the one `MODEL=` names**, which
+is why it is not the default.
 
 Do not take that on faith — `tools/verify_ple_donor.py` samples rows from the target's
 own table and compares them against the dequantized donor, and it does it over **HTTP
 range requests**, so the 102 GB shard never has to be downloaded. Against orcarouter it
 reports p50 relative error 0.022, p99 0.054 and correlation 0.99964 across every sampled
 block — which is precisely fp8-e4m3 rounding noise (e4m3's mantissa step is 6.25%), i.e.
-the same table. Confirming that also means you can **skip the 102 GB shard entirely** and
+the same table. It refuses to pass above a 7% p99.
+
+If you verify first and then opt in, you can also **skip the 102 GB shard entirely** and
 download 81 GB instead of 183 GB.
 
 ```bash
 MODEL=orcarouter/Qwen3.8-Flash-Next-Uncensored-NVFP4
-# the PLE shard is redundant once the donor is verified
-docker run --rm -e HF_HOME=/hf -e HF_TOKEN -v "$HOME/.cache/huggingface:/hf" \
-  --entrypoint bash qwen38-flash-dgx -c \
-  "hf download '$MODEL' --max-workers 8 --exclude 'model-00002-of-00017.safetensors'"
-MODEL=$MODEL scripts/prepare-ct.sh        # builds <snapshot>-ctprep/
+MODEL=$MODEL scripts/download-weights.sh  # the whole checkpoint, 183 GB
+MODEL=$MODEL scripts/prepare-ct.sh        # builds <snapshot>-ctprep/, table as published
 MODEL=$MODEL MODE=ct scripts/serve.sh
 ```
 
-`PLE=keep` skips the splice and serves the checkpoint's own bf16 table; `PLE_DONOR=`
-picks a different donor (default `RadixArk/Qwen3.8-Flash-Next-NVFP4`, which you already
-have).
+Opting into the donor table instead, after verifying it — 81 GB rather than 183 GB,
+because the bf16 table is one shard and is no longer needed:
+
+```bash
+MODEL=$MODEL EXCLUDE='model-00002-of-00017.safetensors' scripts/download-weights.sh
+MODEL=$MODEL PLE=donor scripts/prepare-ct.sh
+```
+
+`PLE_DONOR=` picks a different donor (default `RadixArk/Qwen3.8-Flash-Next-NVFP4`).
 
 **What this costs you, and why.** These checkpoints carry no activation scales, so vLLM
 reads the experts as **weight-only NVFP4** (`use_a16=True`). Both quantization families

@@ -13,13 +13,17 @@
 #     "full_attention" spelling and raises "Invalid layer_type" on it (and would
 #     silently build an empty QSA layer set even if it did not). Renamed back.
 #
-#   - The n-gram (PLE) table is left in BF16: 95.4 GiB on disk instead of the
-#     47.7 GiB an FP8 table takes, which doubles the NVMe read per token and
-#     halves what the page cache can hold. The table is a pure lookup that
-#     abliterations and fine-tunes do not touch, so the FP8 table from a donor
-#     checkpoint of the same base model is substituted in by symlink + an index
-#     rewrite. Set PLE=keep to serve the checkpoint's own BF16 table instead
-#     (supported, just slower).
+#   - The n-gram (PLE) table is left in BF16. That is served as-is by default:
+#     src/vllm_ple_mmap.py has handled 16-bit tables since the AutoRound work, so
+#     PLE=keep needs nothing beyond the layer_types fix above.
+#
+#     PLE=donor is an OPT-IN optimisation. A BF16 table is 95.4 GiB rather than
+#     the 47.7 GiB an FP8 one takes, which doubles the NVMe read per token and
+#     halves what the page cache can hold. Since the table is a pure lookup that
+#     abliterations and fine-tunes do not touch, the FP8 table from a donor
+#     checkpoint of the same base model can be substituted by symlink + an index
+#     rewrite. Understand what that means before enabling it: the served table
+#     then comes from a DIFFERENT repository than the one MODEL= names.
 #
 # VERIFY THE DONOR FIRST. tools/verify_ple_donor.py samples rows from the
 # target's own table -- over HTTP range requests, so the 102 GB shard need not be
@@ -43,7 +47,7 @@ set -euo pipefail
 
 MODEL="${MODEL:?set MODEL to the compressed-tensors repo, e.g. org/Name}"
 PLE_DONOR="${PLE_DONOR:-RadixArk/Qwen3.8-Flash-Next-NVFP4}"
-PLE="${PLE:-donor}"
+PLE="${PLE:-keep}"
 IMAGE="${IMAGE:-qwen38-flash-dgx}"
 HF_CACHE="${HF_CACHE:-$HOME/.cache/huggingface}"
 
@@ -72,7 +76,9 @@ if [ "$PLE" = donor ]; then
   [ -n "$DONOR_HOST" ] || { echo "!! PLE donor $PLE_DONOR not in $HF_CACHE - download it first, or use PLE=keep"; exit 1; }
   DONOR_IN="/hf/hub/models--${PLE_DONOR//\//--}/snapshots/$(basename "$DONOR_HOST")"
   DONOR_ARGS="--donor '$DONOR_IN'"
-  echo ">> PLE table will be taken from $PLE_DONOR (verify with tools/verify_ple_donor.py)"
+  echo ">> PLE=donor: the served n-gram table will come from $PLE_DONOR,"
+  echo "   NOT from $MODEL. Verify they are the same table first:"
+  echo "     tools/verify_ple_donor.py --donor <snapshot> --repo $MODEL"
 else
   echo ">> PLE table: keeping the checkpoint's own (BF16)"
 fi
