@@ -408,6 +408,33 @@ layout — rename `weight_packed` → `weight`, `weight_global_scale` → recipr
 `input_scale` tensors the checkpoint does not have. That is a separate, offline pass; it
 is not in the repo yet.
 
+#### NVFP4 MTP draft experts on a ct checkpoint (`MODE=ct-mtp`)
+
+The same graft as [`MODE=hybrid-mtp`](#nvfp4-mtp-draft-experts-modehybrid-mtp), ported to
+this family by `scripts/prepare-ct-mtp.sh`: the draft head's routed experts go from fused
+BF16 (5.03 GB) to Inferact's NVFP4 (1.42 GB), freeing **3.4 GiB**.
+
+Two things differ from the ModelOpt graft. The donor is ModelOpt-format and the target is
+compressed-tensors, so its expert tensors are transcoded — `weight` → `weight_packed`,
+`weight_scale_2` → **reciprocal** → `weight_global_scale`, `input_scale` dropped (these
+checkpoints carry no activation scales). The reciprocal is not a guess: vLLM feeds both
+formats into the same `convert_to_nvfp4_moe_kernel_format`, and the call sites differ
+exactly there. And the config surgery is one line instead of 29, because
+compressed-tensors targets routed experts with `re:.*mlp\.experts\..*proj$`, which
+matches the MTP experts and nothing else under `mtp.` — so dropping the `re:.*mtp\..*`
+ignore entry quantizes exactly the experts and leaves the draft's attention, shared
+expert and `fc_*` linears BF16. The tool asserts that rather than assuming it.
+
+Where the 3.4 GiB goes is worth knowing: `GPU_MEM` sizes vLLM's arena as a fraction of
+**total** device memory, independent of weight size, so freed weight memory becomes KV
+cache and returns nothing to the system. If you want it as page cache and headroom
+instead, pin the KV pool with `KV_CACHE_MEM` and let the remainder fall back.
+
+```bash
+MODEL=<org/name> scripts/prepare-ct-mtp.sh      # one-time, after prepare-ct.sh
+MODEL=<org/name> MODE=ct-mtp scripts/serve.sh
+```
+
 ## Prefix caching now works (and why it didn't)
 
 `--enable-prefix-caching` used to crash this model on GB10 (`CUDA illegal memory
@@ -729,13 +756,15 @@ src/test_ple_mmap_cpu.py          CPU unit test for the gather (no GPU needed)
 src/test_qsa_exact_topk_cpu.py    CPU unit test for the exact top-k (no GPU needed)
 tools/fp8_convert.py              side-layer bf16 -> blockwise fp8 (by @Saren-Arterius)
 tools/ct_prepare.py               compressed-tensors checkpoint -> servable snapshot (MODE=ct)
+tools/ct_mtp_graft.py             ModelOpt MTP experts -> compressed-tensors, grafted in (MODE=ct-mtp)
 tools/verify_ple_donor.py         prove a donor FP8 PLE table is the same table, over range requests
 scripts/download-weights.sh       MODEL, EXCLUDE, MAX_WORKERS, XET
 scripts/prepare-hybrid.sh         one-time: build the -fp8hybrid snapshot
 scripts/prepare-mtp-graft.sh      one-time: graft the NVFP4 MTP draft experts onto it (MODE=hybrid-mtp)
 scripts/prepare-ct.sh             one-time: build the -ctprep snapshot for a compressed-tensors checkpoint
+scripts/prepare-ct-mtp.sh         one-time: graft the NVFP4 MTP draft experts onto it (MODE=ct-mtp)
 tools/vllm_watch.py               live per-session view of prompts / reasoning / outputs / stats (needs LOG_REQUESTS=1; @0x3dlux)
-scripts/serve.sh                  MODE=nvfp4|hybrid|hybrid-mtp|ct, PREFIX_CACHE, DET_TOPK, DRAFT_VOCAB, MADVISE, EXACT_TOPK, PAD_M4, KV_DTYPE, YARN, ...
+scripts/serve.sh                  MODE=nvfp4|hybrid|hybrid-mtp|ct|ct-mtp, PREFIX_CACHE, DET_TOPK, DRAFT_VOCAB, MADVISE, EXACT_TOPK, PAD_M4, KV_DTYPE, YARN, ...
 scripts/smoke-test.sh             health, coherence, prefix-cache hit, determinism, tok/s
 scripts/greedy-probe.sh           greedy probe set; diff two arms to gate a draft/checkpoint swap
 docs/HOW-IT-WORKS.md

@@ -6,6 +6,7 @@
 #   MODE=hybrid scripts/serve.sh              # NVFP4 experts + fp8 side layers (scripts/prepare-hybrid.sh first)
 #   MODE=hybrid-mtp scripts/serve.sh          # hybrid + NVFP4 MTP draft experts (scripts/prepare-mtp-graft.sh first)
 #   MODEL=<org/name> MODE=ct scripts/serve.sh # a compressed-tensors checkpoint (scripts/prepare-ct.sh first)
+#   MODEL=<org/name> MODE=ct-mtp scripts/serve.sh  # ... plus NVFP4 MTP draft experts (scripts/prepare-ct-mtp.sh)
 #   YARN=1 CTX=500000 scripts/serve.sh        # 500k context via YaRN (validated)
 #   docker logs -f qwen38-flash               # wait for "Application startup complete"
 #
@@ -16,6 +17,8 @@
 #                     hybrid-mtp = hybrid with the MTP draft experts in NVFP4 (grafted from
 #                     Inferact's checkpoint): ~3.4 GB less on the card, ~4x fewer bytes read
 #                     per draft step. Needs scripts/prepare-mtp-graft.sh
+#                     ct-mtp = ct with the MTP draft experts in NVFP4 (~3.4 GiB less on the
+#                     card, which GPU_MEM turns into KV). Needs scripts/prepare-ct-mtp.sh
 #                     ct = an llm-compressor / compressed-tensors checkpoint (side layers
 #                     already 8-bit, BF16 PLE table). Needs scripts/prepare-ct.sh. These
 #                     carry no activation scales, so the MoE runs on Marlin, not
@@ -85,7 +88,7 @@ for REF in main master; do
   REV="$(cat "$REPO_DIR/refs/$REF" 2>/dev/null || true)"
   if [ -n "$REV" ] && [ -d "$REPO_DIR/snapshots/$REV" ]; then SNAP_HOST="$REPO_DIR/snapshots/$REV/"; break; fi
 done
-SNAP_HOST="${SNAP_HOST:-$(ls -dt "$REPO_DIR"/snapshots/*/ 2>/dev/null | grep -v -e '-fp8hybrid' -e '-ctprep' | head -1 || true)}"
+SNAP_HOST="${SNAP_HOST:-$(ls -dt "$REPO_DIR"/snapshots/*/ 2>/dev/null | grep -v -e '-fp8hybrid' -e '-ctprep' -e '-mtpnvfp4' | head -1 || true)}"
 if [ -z "$SNAP_HOST" ]; then
   echo "!! checkpoint not found under $REPO_DIR"
   echo "   run scripts/download-weights.sh first."
@@ -106,14 +109,17 @@ case "$MODE" in
     SNAP_NAME="${SNAP_NAME}${SUFFIX}"
     HYBRID_ENV=(-e VLLM_FP8_HYBRID=1 -e VLLM_USE_DEEP_GEMM=0)
     ;;
-  ct)
-    if [ ! -f "$REPO_DIR/snapshots/${SNAP_NAME}-ctprep/.prepared" ]; then
-      echo "!! compressed-tensors checkpoint not prepared: run scripts/prepare-ct.sh first (one-time)"
+  ct|ct-mtp)
+    SUFFIX="-ctprep"
+    [ "$MODE" = ct-mtp ] && SUFFIX="-ctprep-mtpnvfp4"
+    if [ ! -f "$REPO_DIR/snapshots/${SNAP_NAME}${SUFFIX}/.prepared" ]; then
+      [ "$MODE" = ct ] && echo "!! compressed-tensors checkpoint not prepared: run scripts/prepare-ct.sh first (one-time)" \
+        || echo "!! ct-mtp checkpoint not prepared: run scripts/prepare-ct-mtp.sh first (needs prepare-ct.sh; one-time)"
       exit 1
     fi
-    SNAP_NAME="${SNAP_NAME}-ctprep"
+    SNAP_NAME="${SNAP_NAME}${SUFFIX}"
     ;;
-  *) echo "!! MODE must be nvfp4, hybrid, hybrid-mtp or ct"; exit 1 ;;
+  *) echo "!! MODE must be nvfp4, hybrid, hybrid-mtp, ct or ct-mtp"; exit 1 ;;
 esac
 SNAP_IN="/hf/hub/models--${MODEL//\//--}/snapshots/$SNAP_NAME"
 
